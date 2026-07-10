@@ -24,6 +24,7 @@ import re
 import time
 import uuid
 from datetime import date, datetime
+from pathlib import Path
 
 import gspread
 import pandas as pd
@@ -501,8 +502,251 @@ def appendix2_draft(v: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# AI agent (Claude + tools) - conversational registration over the same engine
+# ---------------------------------------------------------------------------
+
+_REQUIRED_FOR_PROPOSAL = [
+    "legal_name", "registered_address", "firm_type", "contact_person",
+    "contact_mobile", "contact_email", "nature_of_service", "service_category",
+    "pan", "itr_fy_2023_24", "itr_fy_2024_25", "itr_fy_2025_26_will_file",
+    "bank_account_name", "bank_account_number", "ifsc", "bank_name",
+]
+
+_PROPOSAL_FIELDS = {
+    "legal_name": {"type": "string"},
+    "trade_name": {"type": "string"},
+    "registered_address": {"type": "string"},
+    "firm_type": {"type": "string", "enum": FIRM_TYPES},
+    "firm_reg_no": {"type": "string"},
+    "linked_to_government": {"type": "string", "enum": ["Yes", "No"]},
+    "country_of_origin": {"type": "string"},
+    "contact_person": {"type": "string"},
+    "contact_mobile": {"type": "string", "description": "10-digit Indian mobile"},
+    "contact_email": {"type": "string"},
+    "nature_of_service": {"type": "string",
+                          "description": "What they will supply/do, for TDS classification"},
+    "service_category": {"type": "string", "enum": SERVICE_CATEGORIES},
+    "pan": {"type": "string"},
+    "tan": {"type": "string"},
+    "gstin": {"type": "string"},
+    "msme_registered": {"type": "string", "enum": ["Yes", "No"]},
+    "msme_number": {"type": "string"},
+    "esic_number": {"type": "string"},
+    "itr_fy_2023_24": {"type": "string", "enum": ["Yes", "No"]},
+    "itr_fy_2024_25": {"type": "string", "enum": ["Yes", "No"]},
+    "itr_fy_2025_26_will_file": {"type": "string", "enum": ["Yes", "No"]},
+    "bank_account_name": {"type": "string"},
+    "bank_account_number": {"type": "string"},
+    "ifsc": {"type": "string"},
+    "swift": {"type": "string"},
+    "bank_name": {"type": "string"},
+    "bank_branch_address": {"type": "string"},
+}
+
+AGENT_TOOLS = [
+    {
+        "name": "validate_identifiers",
+        "description": ("Validate any Indian statutory identifiers the vendor has "
+                        "provided so far: PAN, GSTIN, IFSC, TAN, Udyam number, "
+                        "mobile, email. Also cross-checks that the GSTIN embeds "
+                        "the PAN. Call this as soon as the user gives any of "
+                        "these values - do not wait until the end."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pan": {"type": "string"}, "gstin": {"type": "string"},
+                "ifsc": {"type": "string"}, "tan": {"type": "string"},
+                "udyam": {"type": "string"}, "mobile": {"type": "string"},
+                "email": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "get_registration_status",
+        "description": "Look up existing registrations by vendor reference (VND-...) or registered email.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "propose_registration",
+        "description": ("Propose the completed vendor registration. Shows the user "
+                        "a Confirm button - the system submits only after they "
+                        "press it. Call only when every required field is "
+                        "collected and identifiers validated clean."),
+        "input_schema": {
+            "type": "object",
+            "properties": _PROPOSAL_FIELDS,
+            "required": _REQUIRED_FOR_PROPOSAL,
+        },
+    },
+]
+
+AGENT_SYSTEM = """You are the Hexagon Vendor Registration Agent. You help vendor
+representatives register as suppliers to Hexagon Geosystems India, operating
+the registration system through your tools.
+
+TODAY is {today}.
+
+WHAT REGISTRATION NEEDS (required): legal name (as per PAN), registered
+address, nature of firm ({firm_types}), contact person + 10-digit mobile +
+email, nature of service (for TDS classification), service category
+({categories}), PAN, the three Section 206AB answers (ITR filed FY 2023-24?
+FY 2024-25? will file FY 2025-26?), and bank details (account holder name as
+per bank records, account number, IFSC, bank name).
+Optional: trade name, ROC/CIN number, GSTIN, TAN, MSME/Udyam number, ESIC,
+SWIFT (international only), branch address, country of origin (default INDIA),
+linked to government (default No).
+
+RULES:
+- Collect details in small batches - at most three questions per message.
+- Call validate_identifiers the moment the user provides a PAN, GSTIN, IFSC,
+  TAN, Udyam, mobile or email. If something fails, tell them exactly what is
+  wrong and ask for a correction before moving on.
+- NEVER invent, autocomplete or guess any identifier or bank detail. What the
+  user types is what gets validated.
+- propose_registration only SHOWS a Confirm button. Never say the registration
+  is submitted - say it is ready and ask them to press Confirm. A [SYSTEM
+  NOTE] in a user message reports what actually happened - trust it.
+- After successful submission the system provides ready-to-sign Annex 4 and
+  206AB documents as downloads, and certificates (PAN card, GST certificate,
+  cancelled cheque) can be AI-verified in the "New registration" tab.
+- The Anti-Corruption Questionnaire (Exhibit 7) must be completed and signed
+  by the vendor's authorised representative directly - you never fill it and
+  should say so if asked.
+- Warm, brief, professional Indian business register. No emojis.
+- Only help with vendor registration matters."""
+
+
+def _agent_system() -> str:
+    return AGENT_SYSTEM.format(
+        today=date.today().isoformat(),
+        firm_types=", ".join(FIRM_TYPES),
+        categories=", ".join(SERVICE_CATEGORIES),
+    )
+
+
+def execute_tool(name: str, args: dict) -> dict:
+    """Reads execute immediately; the only write path is a pending proposal
+    that the user must confirm in the UI."""
+    df = load_vendors()
+
+    if name == "validate_identifiers":
+        out: dict = {}
+        pan = clean_upper(args.get("pan", ""))
+        if args.get("pan"):
+            out["pan"] = "valid" if PAN_RE.match(pan) else \
+                "invalid - expected AAAAA9999A (5 letters, 4 digits, 1 letter)"
+        if args.get("gstin"):
+            g = clean_upper(args["gstin"])
+            if not GSTIN_RE.match(g):
+                out["gstin"] = "invalid - expected 15 characters like 06AAAAA9999A1Z5"
+            elif pan and PAN_RE.match(pan) and g[2:12] != pan:
+                out["gstin"] = (f"format valid BUT it embeds PAN '{g[2:12]}' which does "
+                                f"not match the provided PAN '{pan}' - one of them is wrong")
+            else:
+                out["gstin"] = "valid" + ("" if not pan else " and matches the PAN")
+        if args.get("ifsc"):
+            out["ifsc"] = "valid" if IFSC_RE.match(clean_upper(args["ifsc"])) else \
+                "invalid - expected AAAA0999999 (5th character is zero)"
+        if args.get("tan"):
+            out["tan"] = "valid" if TAN_RE.match(clean_upper(args["tan"])) else \
+                "invalid - expected AAAA99999A"
+        if args.get("udyam"):
+            out["udyam"] = "valid" if UDYAM_RE.match(str(args["udyam"]).strip().upper()) else \
+                "invalid - expected UDYAM-XX-00-0000000"
+        if args.get("mobile"):
+            out["mobile"] = "valid" if valid_mobile(str(args["mobile"])) else \
+                "invalid - must be 10 digits starting 6-9"
+        if args.get("email"):
+            out["email"] = "valid" if EMAIL_RE.match(str(args["email"]).strip()) else \
+                "invalid format"
+        return out or {"note": "no identifiers provided to validate"}
+
+    if name == "get_registration_status":
+        q = str(args.get("query", "")).strip().upper()
+        mine = df[(df["vendor_id"].str.upper() == q)
+                  | (df["contact_email"].str.upper() == q)]
+        return {"registrations": [
+            {"vendor_id": r.vendor_id, "legal_name": r.legal_name,
+             "status": r.status, "submitted": r.created_at,
+             "note_from_hexagon": r.admin_notes}
+            for r in mine.head(5).itertuples()
+        ]}
+
+    if name == "propose_registration":
+        data = {k: str(args.get(k, "")).strip() for k in _PROPOSAL_FIELDS}
+        data["country_of_origin"] = data["country_of_origin"] or "INDIA"
+        data["linked_to_government"] = data["linked_to_government"] or "No"
+        data["msme_registered"] = data["msme_registered"] or "No"
+        problems = validate_vendor(data)
+        if problems:
+            return {"accepted": False, "problems": problems}
+        st.session_state.agent_pending = {"kind": "register", "data": data}
+        return {"accepted": True,
+                "status": "Proposal shown to the user with a Confirm button. "
+                          "Ask them to review it and press Confirm."}
+
+    return {"error": f"Unknown tool: {name}"}
+
+
+def run_agent(client, api_history: list, display_log: list, max_iters: int = 8):
+    retried_empty = False
+    for _ in range(max_iters):
+        resp = client.messages.create(
+            model=CLAUDE_MODEL, max_tokens=3000,
+            system=_agent_system(), tools=AGENT_TOOLS, messages=api_history,
+        )
+        blocks = []
+        for b in resp.content:
+            if b.type == "text" and b.text.strip():
+                blocks.append({"type": "text", "text": b.text})
+                display_log.append({"role": "assistant", "kind": "text", "text": b.text})
+            elif b.type == "tool_use":
+                blocks.append({"type": "tool_use", "id": b.id, "name": b.name,
+                               "input": b.input})
+                display_log.append({"role": "assistant", "kind": "tool",
+                                    "text": f"{b.name} → "
+                                            f"{json.dumps(b.input, default=str)[:140]}"})
+        if not blocks:  # adaptive-thinking starvation guard
+            if retried_empty:
+                display_log.append({"role": "assistant", "kind": "text",
+                                    "text": "Sorry, I had trouble responding - please try "
+                                            "again, or use the New registration tab."})
+                return
+            retried_empty = True
+            time.sleep(1)
+            continue
+        api_history.append({"role": "assistant", "content": blocks})
+        tool_calls = [b for b in blocks if b["type"] == "tool_use"]
+        if resp.stop_reason == "tool_use" and tool_calls:
+            results = []
+            for tc in tool_calls:
+                out = execute_tool(tc["name"], tc["input"])
+                results.append({"type": "tool_result", "tool_use_id": tc["id"],
+                                "content": json.dumps(out, default=str)})
+            api_history.append({"role": "user", "content": results})
+            continue
+        return
+    display_log.append({"role": "assistant", "kind": "text",
+                        "text": "I've reached my step limit for this request - "
+                                "please rephrase or use the form tabs."})
+
+
+# ---------------------------------------------------------------------------
 # Header + admin gate
 # ---------------------------------------------------------------------------
+
+def _logo_html() -> str:
+    """Embed logo.png from the repo root; fall back to the ⬡ mark."""
+    p = Path(__file__).parent / "logo.png"
+    if p.exists():
+        b64 = base64.b64encode(p.read_bytes()).decode()
+        return (f'<img src="data:image/png;base64,{b64}" '
+                'style="height:52px;width:auto;" alt="Hexagon"/>')
+    return '<span class="hex-title">⬡</span>'
 
 @st.dialog("Admin access")
 def admin_login_dialog():
@@ -517,8 +761,10 @@ def admin_login_dialog():
 
 head_l, head_r = st.columns([6, 1])
 with head_l:
-    st.markdown('<div class="hex-title">⬡ Hexagon Vendor Registration</div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:14px;">{_logo_html()}'
+        '<span class="hex-title">Hexagon Vendor Registration</span></div>',
+        unsafe_allow_html=True)
     st.markdown('<p class="hex-sub">Register once - we prepare your documents. '
                 'Annex 4 and the 206AB declaration are generated ready to sign.</p>',
                 unsafe_allow_html=True)
@@ -619,7 +865,113 @@ if st.session_state.get("admin_ok"):
 # Vendor-facing tabs
 # ---------------------------------------------------------------------------
 
-tab_reg, tab_track = st.tabs(["New registration", "Track my registration"])
+tab_ai, tab_reg, tab_track = st.tabs(
+    ["AI Agent", "New registration", "Track my registration"])
+
+with tab_ai:
+    st.subheader("Hexagon Vendor Registration Agent")
+    st.caption("Register conversationally - the agent collects your details, "
+               "validates PAN/GSTIN/IFSC as you go, and prepares the submission. "
+               "Nothing is submitted until you press Confirm. Certificate uploads "
+               "and AI verification are in the New registration tab.")
+    client = get_claude()
+    if client is None:
+        st.info("The AI agent needs ANTHROPIC_API_KEY in Streamlit Secrets. "
+                "Registration via the form tab works without it.")
+    else:
+        st.session_state.setdefault("agent_api", [])
+        st.session_state.setdefault("agent_log", [])
+        st.session_state.setdefault("agent_pending", None)
+        st.session_state.setdefault("agent_note", "")
+        st.session_state.setdefault("agent_last_row", None)
+
+        for entry in st.session_state.agent_log:
+            with st.chat_message(entry["role"]):
+                if entry.get("kind") == "tool":
+                    st.caption(f"🔧 {entry['text']}")
+                else:
+                    st.markdown(entry["text"])
+
+        if st.session_state.agent_last_row:
+            lr = st.session_state.agent_last_row
+            g1, g2 = st.columns(2)
+            g1.download_button("Annex 4 - filled (.docx)", data=make_annex4(lr),
+                               file_name=f"{lr['vendor_id']}_Annex4.docx",
+                               use_container_width=True, key="agent_dl_a4")
+            g2.download_button("206AB Declaration (.docx)", data=make_206ab(lr),
+                               file_name=f"{lr['vendor_id']}_206AB.docx",
+                               use_container_width=True, key="agent_dl_206")
+
+        pending = st.session_state.agent_pending
+        if pending and pending["kind"] == "register":
+            d = pending["data"]
+            st.info(f"**Ready to submit:** {d['legal_name']} ({d['firm_type']})  \n"
+                    f"PAN `{clean_upper(d['pan'])}` · GSTIN `{clean_upper(d['gstin']) or '-'}`  \n"
+                    f"{d['contact_person']} · {d['contact_mobile']} · {d['contact_email']}  \n"
+                    f"Bank: {d['bank_name']} · A/c {d['bank_account_number']} · "
+                    f"IFSC `{clean_upper(d['ifsc'])}`")
+            cc1, cc2 = st.columns(2)
+            if cc1.button("Confirm submission", use_container_width=True,
+                          key="agent_confirm"):
+                fresh = load_vendors()
+                problems = validate_vendor(pending["data"])
+                if problems:
+                    note = "Could not submit: " + " ".join(problems)
+                else:
+                    row = {c: str(pending["data"].get(c, "")).strip()
+                           for c in SHEET_COLUMNS}
+                    row["vendor_id"] = gen_vendor_id(fresh)
+                    row["status"] = "Submitted"
+                    row["pan"] = clean_upper(row["pan"])
+                    row["gstin"] = clean_upper(row["gstin"])
+                    row["tan"] = clean_upper(row["tan"])
+                    row["ifsc"] = clean_upper(row["ifsc"])
+                    row["contact_mobile"] = re.sub(r"\D", "", row["contact_mobile"])
+                    row["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    row["updated_at"] = row["created_at"]
+                    append_vendor(row)
+                    st.session_state.agent_last_row = row
+                    note = (f"Registration submitted - reference **{row['vendor_id']}**. "
+                            "Download the ready-to-sign Annex 4 and 206AB documents "
+                            "above, and upload certificates for AI verification in "
+                            "the New registration tab if you wish.")
+                st.session_state.agent_log.append(
+                    {"role": "assistant", "kind": "text", "text": note})
+                st.session_state.agent_note = re.sub(r"\*", "", note)
+                st.session_state.agent_pending = None
+                st.rerun()
+            if cc2.button("Discard", use_container_width=True, key="agent_discard"):
+                st.session_state.agent_note = "The user discarded the proposal without confirming."
+                st.session_state.agent_pending = None
+                st.rerun()
+
+        col_reset, _ = st.columns([1, 4])
+        if st.session_state.agent_log and col_reset.button("Start over"):
+            for k in ("agent_api", "agent_log", "agent_pending",
+                      "agent_note", "agent_last_row"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+        if prompt := st.chat_input(
+                "e.g. I want to register my company as a vendor, or "
+                "what's the status of VND-1A2B3C?"):
+            content = prompt
+            if st.session_state.agent_note:
+                content = f"[SYSTEM NOTE: {st.session_state.agent_note}]\n\n{prompt}"
+                st.session_state.agent_note = ""
+            st.session_state.agent_api.append({"role": "user", "content": content})
+            st.session_state.agent_log.append(
+                {"role": "user", "kind": "text", "text": prompt})
+            with st.spinner("Working…"):
+                try:
+                    run_agent(client, st.session_state.agent_api,
+                              st.session_state.agent_log)
+                except Exception as e:  # noqa: BLE001
+                    st.session_state.agent_log.append(
+                        {"role": "assistant", "kind": "text",
+                         "text": f"Something went wrong ({type(e).__name__}). "
+                                 "Please try again or use the form tabs."})
+            st.rerun()
 
 with tab_reg:
     st.caption("Fields marked * are required. Your details feed every "
